@@ -61,3 +61,15 @@ fn tidy_ocr(s: &str) -> String {
     let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
     collapsed.trim().to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tidy_ocr_removes_soft_hyphen_and_wraps() {
+        let s = "hy\u{00AD}phen-\nated\ntext  with   spaces\r\nok";
+        let got = tidy_ocr(s);
+        assert_eq!(got, "hyphenated text with spaces ok");
+    }
+}

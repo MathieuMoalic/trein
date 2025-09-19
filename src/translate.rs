@@ -100,3 +100,55 @@ pub fn deepl_target(code: &str) -> Result<String> {
         _ => Err(anyhow!("Unsupported DeepL target code: {}", s)),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use httpmock::prelude::*;
+    use serde_json::json;
+
+    #[test]
+    fn deepl_code_normalization_and_validation() {
+        // source
+        assert_eq!(deepl_source("en").unwrap(), "EN");
+        assert_eq!(deepl_source("zh").unwrap(), "ZH");
+        // target-only code should error for source
+        assert!(deepl_source("en-gb").is_err());
+
+        // target
+        assert_eq!(deepl_target("pl").unwrap(), "PL");
+        assert_eq!(deepl_target("zh-hant").unwrap(), "ZH-HANT");
+        assert!(deepl_target("xx").is_err());
+    }
+
+    #[tokio::test]
+    async fn translate_deepl_makes_http_call_and_parses() {
+        let server = MockServer::start();
+
+        let m = server.mock(|when, then| {
+            when.method(POST).path("/v2/translate");
+            then.status(200).json_body(json!({
+                "translations": [{
+                    "text": "Bonjour",
+                    "detected_source_language": "EN"
+                }]
+            }));
+        });
+
+        let client = reqwest::Client::new();
+        let (text, detected) = super::translate_deepl(
+            &client,
+            "dummy-key",
+            &server.base_url(),
+            "Hello",
+            "FR",
+            Some("EN"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(text, "Bonjour");
+        assert_eq!(detected.as_deref(), Some("EN"));
+        m.assert();
+    }
+}

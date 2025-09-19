@@ -30,3 +30,41 @@ pub struct Args {
     #[arg(long = "deepl-api-key", env = "DEEPL_API_KEY")]
     pub deepl_api_key: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_defaults() {
+        let args = Args::parse_from(["trein"]);
+        assert_eq!(args.source_lang, "EN");
+        assert_eq!(args.target_lang, "EN");
+        assert!(!args.copy);
+        assert!(args.ocr_lang.is_none());
+        // deepl_api_key is None unless provided
+        assert!(args.deepl_api_key.is_none());
+    }
+
+    #[test]
+    fn parses_all_flags() {
+        let args = Args::parse_from([
+            "trein",
+            "-s",
+            "JA",
+            "-t",
+            "EN-GB",
+            "--copy",
+            "--ocr-lang",
+            "chi_tra",
+            "--deepl-api-key",
+            "k123",
+        ]);
+        assert_eq!(args.source_lang, "JA");
+        assert_eq!(args.target_lang, "EN-GB");
+        assert!(args.copy);
+        assert_eq!(args.ocr_lang.as_deref(), Some("chi_tra"));
+        assert_eq!(args.deepl_api_key.as_deref(), Some("k123"));
+    }
+}

@@ -41,3 +41,20 @@ pub fn tesseract_pack_from_deepl_source(src: &str) -> Result<&'static str> {
     };
     Ok(pack)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_known_codes() {
+        assert_eq!(tesseract_pack_from_deepl_source("EN").unwrap(), "eng");
+        assert_eq!(tesseract_pack_from_deepl_source("ZH").unwrap(), "chi_sim");
+    }
+
+    #[test]
+    fn errors_on_unknown_code() {
+        let err = tesseract_pack_from_deepl_source("XX").unwrap_err();
+        assert!(format!("{err}").contains("mapping"));
+    }
+}
