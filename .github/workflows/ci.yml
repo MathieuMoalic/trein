@@ -2,6 +2,7 @@ name: release-artifacts
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 jobs:
   linux:
@@ -14,14 +15,26 @@ jobs:
           - runner: ubuntu-22.04-arm64
             arch: aarch64
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v30
+
       - name: Build (musl)
         run: |
           nix build .#trein
-          mv result/trein trein-${{ github.ref_name }}-linux-${{ matrix.arch }}
-      - uses: actions/upload-artifact@v4
+          cp result/bin/trein "trein-${{ github.ref_name }}-linux-${{ matrix.arch }}"
+
+      - name: Upload job artifacts
+        uses: actions/upload-artifact@v4
         with:
           name: trein-linux-${{ matrix.arch }}
-          path: trein-*-linux-${{ matrix.arch }}
+          path: trein-${{ github.ref_name }}-linux-${{ matrix.arch }}
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            trein-${{ github.ref_name }}-linux-${{ matrix.arch }}
