@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use serde::Deserialize;
 use std::env;
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -24,13 +25,17 @@ struct Args {
     target_lang: String,
 
     /// Also copy the translation to the Wayland clipboard using wl-copy (if available).
-    #[arg(long = "copy")]
+    #[arg(short = 'c', long = "copy")]
     copy: bool,
 
-    /// Optional override for the Tesseract pack if you need to force it (e.g., chi_tra).
+    /// Optional override for the Tesseract language if you need to force it (e.g., chi_tra).
     /// Normally derived from --source-lang.
-    #[arg(long = "ocr-pack")]
-    ocr_pack_override: Option<String>,
+    #[arg(long = "ocr-lang")]
+    ocr_lang: Option<String>,
+
+    /// DeepL API key. If omitted, falls back to $DEEPL_API_KEY, then config files.
+    #[arg(long = "deepl-api-key", env = "DEEPL_API_KEY")]
+    deepl_api_key: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -54,7 +59,7 @@ async fn main() -> Result<()> {
     // Validate DeepL codes (strict) and decide the Tesseract pack
     let src = deepl_source(&args.source_lang)?; // e.g., "EN", "ZH"
     let tgt = deepl_target(&args.target_lang)?; // e.g., "EN-GB", "PT-BR"
-    let ocr_pack = if let Some(p) = &args.ocr_pack_override {
+    let ocr_pack = if let Some(p) = &args.ocr_lang {
         p.clone()
     } else {
         tesseract_pack_from_deepl_source(&src)?.to_string() // e.g., EN→eng, ZH→chi_sim
@@ -73,7 +78,7 @@ async fn main() -> Result<()> {
     }
 
     // 4) Translate with DeepL (use explicit source & target)
-    let api_key = deepl_api_key()?;
+    let api_key = resolve_deepl_api_key(&args)?;
     let base = deepl_base_url();
     let client = reqwest::Client::new();
 
@@ -200,8 +205,52 @@ async fn translate_deepl(
     ))
 }
 
-fn deepl_api_key() -> Result<String> {
-    env::var("DEEPL_API_KEY").context("Set your DeepL key in DEEPL_API_KEY (Free or Pro).")
+fn resolve_deepl_api_key(args: &Args) -> Result<String> {
+    // 1) CLI flag (already includes env fallback via clap's `env` attribute)
+    if let Some(k) = args.deepl_api_key.as_deref().filter(|s| !s.is_empty()) {
+        return Ok(k.to_string());
+    }
+
+    // 2) Explicit env var fallback (in case you remove the clap `env` attribute later)
+    if let Ok(k) = env::var("DEEPL_API_KEY") {
+        if !k.trim().is_empty() {
+            return Ok(k);
+        }
+    }
+
+    // 3) Config files
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
+        candidates.push(PathBuf::from(xdg).join("trein/config.toml"));
+    }
+    if let Ok(home) = env::var("HOME") {
+        candidates.push(PathBuf::from(home).join(".config/trein/config.toml"));
+    }
+
+    for p in candidates {
+        if let Ok(content) = fs::read_to_string(&p) {
+            let line = content.trim();
+            if line.is_empty() {
+                continue;
+            }
+            // File must be exactly: DEEPL_API_KEY=...
+            // (We’re a bit forgiving and will accept just the value too.)
+            let value = if let Some(rest) = line.strip_prefix("DEEPL_API_KEY=") {
+                rest.trim()
+            } else {
+                line
+            };
+            if !value.is_empty() {
+                return Ok(value.to_string());
+            }
+        }
+    }
+
+    bail!(
+        "Set your DeepL key via --deepl-api-key, $DEEPL_API_KEY, or a config file at \
+         $XDG_CONFIG_HOME/trein/config.toml (or $HOME/.config/trein/config.toml) containing a single line: \
+         DEEPL_API_KEY=..."
+    );
 }
 
 fn deepl_base_url() -> String {
@@ -240,8 +289,6 @@ fn maybe_copy_to_clipboard(copy: bool, text: &str) {
     }
 }
 
-
-/// Light cleanup to make OCR text nicer for translation
 fn tidy_ocr(s: &str) -> String {
     let s = s.replace('\u{00AD}', ""); // soft hyphens
     let s = s.replace("-\n", ""); // hyphenated line break
