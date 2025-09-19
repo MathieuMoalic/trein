@@ -1,0 +1,27 @@
+name: release-artifacts
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm64
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v30
+      - name: Build (musl)
+        run: |
+          nix build .#trein
+          mv result/trein trein-${{ github.ref_name }}-linux-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: trein-linux-${{ matrix.arch }}
+          path: trein-*-linux-${{ matrix.arch }}

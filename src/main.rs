@@ -240,7 +240,6 @@ fn maybe_copy_to_clipboard(copy: bool, text: &str) {
     }
 }
 
-/* ───────────────────── utilities you already had ───────────────────── */
 
 /// Light cleanup to make OCR text nicer for translation
 fn tidy_ocr(s: &str) -> String {
@@ -287,7 +286,6 @@ fn deepl_target(code: &str) -> Result<String> {
     }
     let s = up.as_str();
     match s {
-        // DeepL target list (exact)
         "AR" | "BG" | "CS" | "DA" | "DE" | "EL" | "EN" | "EN-GB" | "EN-US" | "ES" | "ES-419"
         | "ET" | "FI" | "FR" | "HE" | "HU" | "ID" | "IT" | "JA" | "KO" | "LT" | "LV" | "NB"
         | "NL" | "PL" | "PT" | "PT-BR" | "PT-PT" | "RO" | "RU" | "SK" | "SL" | "SV" | "TH"
@@ -317,7 +315,7 @@ fn tesseract_pack_from_deepl_source(src: &str) -> Result<&'static str> {
         "KO" => "kor",
         "LT" => "lit",
         "LV" => "lav",
-        "NB" => "nor", // Bokmål → generic Norwegian in Tesseract
+        "NB" => "nor",
         "NL" => "nld",
         "PL" => "pol",
         "PT" => "por",
@@ -330,8 +328,6 @@ fn tesseract_pack_from_deepl_source(src: &str) -> Result<&'static str> {
         "TR" => "tur",
         "UK" => "ukr",
         "VI" => "vie",
-        // ZH is ambiguous; default to Simplified (chi_sim).
-        // If you need Traditional OCR, pass --ocr-pack chi_tra.
         "ZH" => "chi_sim",
         other => {
             bail!("No Tesseract pack mapping for DeepL source {}", other);
