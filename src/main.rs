@@ -1,54 +1,24 @@
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, bail};
 use clap::Parser;
-use serde::Deserialize;
-use std::env;
-use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use tempfile::{TempDir, tempdir};
+use tempfile::TempDir;
 
-#[derive(Parser, Debug)]
-#[command(name = "trein", version, about = "Select area → OCR → DeepL translate")]
-struct Args {
-    /// Source language code: "AR" | "BG" | "CS" | "DA" | "DE" | "EL" | "EN" | "ES" | "ET" | "FI" | "FR" | "HE"
-    /// | "HU" | "ID" | "IT" | "JA" | "KO" | "LT" | "LV" | "NB" | "NL" | "PL" | "PT" | "RO"
-    /// | "RU" | "SK" | "SL" | "SV" | "TH" | "TR" | "UK" | "VI" | "ZH"
-    #[arg(short = 's', long = "source-lang", default_value = "EN")]
-    source_lang: String,
+mod cli;
+mod clipboard;
+mod config;
+mod ocr;
+mod output;
+mod tesseract;
+mod translate;
+mod wayland;
 
-    /// Target language code: "AR" | "BG" | "CS" | "DA" | "DE" | "EL" | "EN" | "EN-GB" | "EN-US" | "ES" | "ES-419"
-    /// | "ET" | "FI" | "FR" | "HE" | "HU" | "ID" | "IT" | "JA" | "KO" | "LT" | "LV" | "NB"
-    /// | "NL" | "PL" | "PT" | "PT-BR" | "PT-PT" | "RO" | "RU" | "SK" | "SL" | "SV" | "TH"
-    /// | "TR" | "UK" | "VI" | "ZH" | "ZH-HANS" | "ZH-HANT"
-    #[arg(short = 't', long = "target-lang", default_value = "EN")]
-    target_lang: String,
-
-    /// Also copy the translation to the Wayland clipboard using wl-copy (if available).
-    #[arg(short = 'c', long = "copy")]
-    copy: bool,
-
-    /// Optional override for the Tesseract language if you need to force it (e.g., chi_tra).
-    /// Normally derived from --source-lang.
-    #[arg(long = "ocr-lang")]
-    ocr_lang: Option<String>,
-
-    /// DeepL API key. If omitted, falls back to $DEEPL_API_KEY, then config files.
-    #[arg(long = "deepl-api-key", env = "DEEPL_API_KEY")]
-    deepl_api_key: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct DeeplTranslation {
-    text: String,
-    #[serde(default)]
-    detected_source_language: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct DeeplResponse {
-    translations: Vec<DeeplTranslation>,
-}
+use crate::cli::Args;
+use crate::clipboard::maybe_copy_to_clipboard;
+use crate::config::{deepl_base_url, resolve_deepl_api_key};
+use crate::ocr::{capture_region, ocr_image, select_region};
+use crate::output::print_result;
+use crate::tesseract::tesseract_pack_from_deepl_source;
+use crate::translate::{deepl_source, deepl_target, translate_deepl};
+use crate::wayland::require_wayland;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -69,7 +39,7 @@ async fn main() -> Result<()> {
     let geometry = select_region()?;
 
     // 2) Screenshot to temp file
-    let (tmpdir, png_path) = capture_region(&geometry)?;
+    let (tmpdir, png_path): (TempDir, std::path::PathBuf) = capture_region(&geometry)?;
 
     // 3) OCR with the decided Tesseract pack
     let ocr_text = ocr_image(&png_path, &ocr_pack)?;
@@ -99,286 +69,4 @@ async fn main() -> Result<()> {
     // keep tempdir alive until here
     drop(tmpdir);
     Ok(())
-}
-
-fn require_wayland() -> Result<()> {
-    if env::var("WAYLAND_DISPLAY").is_err() {
-        bail!("This tool must run under Wayland (Hyprland). $WAYLAND_DISPLAY is not set.");
-    }
-    Ok(())
-}
-
-fn select_region() -> Result<String> {
-    let out = Command::new("slurp")
-        .args(["-f", "%x,%y %wx%h"])
-        .output()
-        .context("Failed to run `slurp` (is it installed?)")?;
-
-    if !out.status.success() {
-        bail!("Selection cancelled or `slurp` failed.");
-    }
-    let geometry = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if geometry.is_empty() {
-        bail!("No selection geometry received from `slurp`.");
-    }
-    Ok(geometry)
-}
-
-fn capture_region(geometry: &str) -> Result<(TempDir, PathBuf)> {
-    let tmpdir = tempdir().context("Could not create temp dir")?;
-    let png_path = tmpdir.path().join("capture.png");
-    let png_path_str = png_path.to_string_lossy().to_string();
-
-    let status = Command::new("grim")
-        .args(["-g", geometry, &png_path_str])
-        .status()
-        .context("Failed to run `grim` (is it installed?)")?;
-    if !status.success() {
-        bail!("`grim` failed to capture the region.");
-    }
-    Ok((tmpdir, png_path))
-}
-
-fn ocr_image(png_path: &Path, ocr_lang: &str) -> Result<String> {
-    let png = png_path
-        .to_str()
-        .ok_or_else(|| anyhow!("Screenshot path not valid UTF-8"))?
-        .to_string();
-
-    let out = Command::new("tesseract")
-        .args([
-            &png,
-            &String::from("stdout"),
-            &String::from("-l"),
-            &String::from(ocr_lang),
-        ])
-        .output()
-        .context("Failed to run `tesseract` (is it installed, with language data?)")?;
-
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!("Tesseract failed: {stderr}");
-    }
-
-    let raw = String::from_utf8_lossy(&out.stdout).to_string();
-    Ok(tidy_ocr(&raw))
-}
-
-async fn translate_deepl(
-    client: &reqwest::Client,
-    api_key: &str,
-    base_url: &str,
-    text: &str,
-    target: &str,
-    source_opt: Option<&str>,
-) -> Result<(String, Option<String>)> {
-    let url = format!("{}/v2/translate", base_url);
-
-    // form fields
-    let mut form: Vec<(String, String)> = vec![
-        ("auth_key".into(), api_key.to_string()),
-        ("text".into(), text.to_string()),
-        ("target_lang".into(), target.to_string()),
-    ];
-    if let Some(src) = source_opt {
-        form.push(("source_lang".into(), src.to_string()));
-    }
-
-    let resp = client
-        .post(url)
-        .form(&form)
-        .send()
-        .await
-        .context("Failed to contact DeepL")?
-        .error_for_status()
-        .context("DeepL returned an error status")?;
-
-    let parsed: DeeplResponse = resp.json().await.context("Invalid JSON from DeepL")?;
-    let first = parsed
-        .translations
-        .get(0)
-        .ok_or_else(|| anyhow!("No translation in response"))?;
-
-    Ok((
-        first.text.trim().to_string(),
-        first.detected_source_language.clone(),
-    ))
-}
-
-fn resolve_deepl_api_key(args: &Args) -> Result<String> {
-    // 1) CLI flag (already includes env fallback via clap's `env` attribute)
-    if let Some(k) = args.deepl_api_key.as_deref().filter(|s| !s.is_empty()) {
-        return Ok(k.to_string());
-    }
-
-    // 2) Explicit env var fallback (in case you remove the clap `env` attribute later)
-    if let Ok(k) = env::var("DEEPL_API_KEY") {
-        if !k.trim().is_empty() {
-            return Ok(k);
-        }
-    }
-
-    // 3) Config files
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
-        candidates.push(PathBuf::from(xdg).join("trein/config.toml"));
-    }
-    if let Ok(home) = env::var("HOME") {
-        candidates.push(PathBuf::from(home).join(".config/trein/config.toml"));
-    }
-
-    for p in candidates {
-        if let Ok(content) = fs::read_to_string(&p) {
-            let line = content.trim();
-            if line.is_empty() {
-                continue;
-            }
-            // File must be exactly: DEEPL_API_KEY=...
-            // (We’re a bit forgiving and will accept just the value too.)
-            let value = if let Some(rest) = line.strip_prefix("DEEPL_API_KEY=") {
-                rest.trim()
-            } else {
-                line
-            };
-            if !value.is_empty() {
-                return Ok(value.to_string());
-            }
-        }
-    }
-
-    bail!(
-        "Set your DeepL key via --deepl-api-key, $DEEPL_API_KEY, or a config file at \
-         $XDG_CONFIG_HOME/trein/config.toml (or $HOME/.config/trein/config.toml) containing a single line: \
-         DEEPL_API_KEY=..."
-    );
-}
-
-fn deepl_base_url() -> String {
-    env::var("DEEPL_API_BASE").unwrap_or_else(|_| "https://api-free.deepl.com".to_string())
-}
-
-fn print_result(
-    ocr_lang: &str,
-    ocr_text: &str,
-    target: &str,
-    translation: &str,
-    detected_src: Option<&str>,
-) {
-    println!("=== OCR (lang: {}) ===\n{}\n", ocr_lang, ocr_text.trim());
-    if let Some(src) = detected_src {
-        println!(
-            "=== Translation → {} (detected: {}) ===\n{}\n",
-            target, src, translation
-        );
-    } else {
-        println!("=== Translation → {} ===\n{}\n", target, translation);
-    }
-}
-
-fn maybe_copy_to_clipboard(copy: bool, text: &str) {
-    if !copy {
-        return;
-    }
-    if let Ok(mut child) = Command::new("wl-copy").stdin(Stdio::piped()).spawn() {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-        let _ = child.wait();
-    } else {
-        eprintln!("(Tip) wl-copy not found, skipping clipboard copy.");
-    }
-}
-
-fn tidy_ocr(s: &str) -> String {
-    let s = s.replace('\u{00AD}', ""); // soft hyphens
-    let s = s.replace("-\n", ""); // hyphenated line break
-    let s = s.replace('\r', "").replace('\n', " "); // newlines → spaces
-    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    collapsed.trim().to_string()
-}
-fn deepl_source(code: &str) -> Result<String> {
-    use std::fmt::Write;
-    let mut up = String::with_capacity(code.len());
-    for ch in code.chars() {
-        up.write_char(if ch == '_' {
-            '-'
-        } else {
-            ch.to_ascii_uppercase()
-        })?;
-    }
-    let s = up.as_str();
-    match s {
-        // DeepL source list (exact)
-        "AR" | "BG" | "CS" | "DA" | "DE" | "EL" | "EN" | "ES" | "ET" | "FI" | "FR" | "HE"
-        | "HU" | "ID" | "IT" | "JA" | "KO" | "LT" | "LV" | "NB" | "NL" | "PL" | "PT" | "RO"
-        | "RU" | "SK" | "SL" | "SV" | "TH" | "TR" | "UK" | "VI" | "ZH" => Ok(s.to_string()),
-        // Helpful guidance if a target-only code is mistakenly supplied
-        "EN-GB" | "EN-US" | "PT-BR" | "PT-PT" | "ZH-HANS" | "ZH-HANT" | "ES-419" => Err(anyhow!(
-            "‘{}’ is a target-only DeepL code. Use the source variant (e.g., EN / PT / ZH) for --source-lang.",
-            s
-        )),
-        _ => Err(anyhow!("Unsupported DeepL source code: {}", s)),
-    }
-}
-
-fn deepl_target(code: &str) -> Result<String> {
-    use std::fmt::Write;
-    let mut up = String::with_capacity(code.len());
-    for ch in code.chars() {
-        up.write_char(if ch == '_' {
-            '-'
-        } else {
-            ch.to_ascii_uppercase()
-        })?;
-    }
-    let s = up.as_str();
-    match s {
-        "AR" | "BG" | "CS" | "DA" | "DE" | "EL" | "EN" | "EN-GB" | "EN-US" | "ES" | "ES-419"
-        | "ET" | "FI" | "FR" | "HE" | "HU" | "ID" | "IT" | "JA" | "KO" | "LT" | "LV" | "NB"
-        | "NL" | "PL" | "PT" | "PT-BR" | "PT-PT" | "RO" | "RU" | "SK" | "SL" | "SV" | "TH"
-        | "TR" | "UK" | "VI" | "ZH" | "ZH-HANS" | "ZH-HANT" => Ok(s.to_string()),
-        _ => Err(anyhow!("Unsupported DeepL target code: {}", s)),
-    }
-}
-
-fn tesseract_pack_from_deepl_source(src: &str) -> Result<&'static str> {
-    let pack = match src {
-        "AR" => "ara",
-        "BG" => "bul",
-        "CS" => "ces",
-        "DA" => "dan",
-        "DE" => "deu",
-        "EL" => "ell",
-        "EN" => "eng",
-        "ES" => "spa",
-        "ET" => "est",
-        "FI" => "fin",
-        "FR" => "fra",
-        "HE" => "heb",
-        "HU" => "hun",
-        "ID" => "ind",
-        "IT" => "ita",
-        "JA" => "jpn",
-        "KO" => "kor",
-        "LT" => "lit",
-        "LV" => "lav",
-        "NB" => "nor",
-        "NL" => "nld",
-        "PL" => "pol",
-        "PT" => "por",
-        "RO" => "ron",
-        "RU" => "rus",
-        "SK" => "slk",
-        "SL" => "slv",
-        "SV" => "swe",
-        "TH" => "tha",
-        "TR" => "tur",
-        "UK" => "ukr",
-        "VI" => "vie",
-        "ZH" => "chi_sim",
-        other => {
-            bail!("No Tesseract pack mapping for DeepL source {}", other);
-        }
-    };
-    Ok(pack)
 }
